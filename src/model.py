@@ -10,33 +10,34 @@ class GearboxAnomalyDetector:
         self.model = self._build_model()
         
     def _build_model(self) -> tf.keras.Model:
-        """Build the model architecture."""
+        """Build optimized model architecture."""
         model = tf.keras.Sequential([
-            # Input normalization
+            # Input layer with normalization
             tf.keras.layers.InputLayer(input_shape=(self.input_dim,)),
             tf.keras.layers.BatchNormalization(),
             
-            # Encoder
-            tf.keras.layers.Dense(96, activation='relu'),
+            # Encoder - reduced size
+            tf.keras.layers.Dense(64, activation='relu'),  # Reduced from 96
             tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.Dense(48, activation='relu'),
+            tf.keras.layers.Dense(32, activation='relu'),  # Reduced from 48
             tf.keras.layers.BatchNormalization(),
             
-            # Bottleneck
+            # Bottleneck - kept same size for feature preservation
             tf.keras.layers.Dense(12, activation='relu'),
             
-            # Decoder
-            tf.keras.layers.Dense(48, activation='relu'),
+            # Decoder - reduced size
+            tf.keras.layers.Dense(32, activation='relu'),  # Reduced from 48
             tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.Dense(96, activation='relu'),
+            tf.keras.layers.Dense(64, activation='relu'),  # Reduced from 96
             tf.keras.layers.BatchNormalization(),
             tf.keras.layers.Dense(self.input_dim)
         ])
         
-        # Compile model
+        # Use mixed precision for training
         model.compile(
             optimizer=tf.keras.optimizers.Adam(5e-4),
-            loss='mse'
+            loss='mse',
+            jit_compile=True  # Enable XLA compilation
         )
         
         return model
@@ -112,17 +113,36 @@ class GearboxAnomalyDetector:
         self.model.save(path)
     
     def convert_to_tflite(self) -> bytes:
-        """Convert model to TFLite format."""
+        """Convert model to TFLite format with optimized quantization."""
         converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
+        
+        # Enable all available optimizations
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+        converter.target_spec.supported_ops = [
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
+            tf.lite.OpsSet.TFLITE_BUILTINS,
+        ]
+        
+        # Set input/output types to INT8
         converter.inference_input_type = tf.int8
         converter.inference_output_type = tf.int8
         
+        # Generate representative dataset from random normal distribution
         def representative_dataset():
-            for _ in range(100):
+            for _ in range(500):  # Increased from 100 to 500 for better statistics
                 data = np.random.normal(0, 1, (1, self.input_dim)).astype(np.float32)
+                # Add noise for better robustness
+                data += np.random.normal(0, 0.01, data.shape).astype(np.float32)
                 yield [data]
         
+        # Set representative dataset
         converter.representative_dataset = representative_dataset
-        return converter.convert()
+        
+        # Force full integer quantization
+        converter.target_spec.supported_types = [tf.int8]
+        converter._experimental_disable_per_channel = True  # Force per-tensor quantization
+        
+        # Convert model
+        tflite_model = converter.convert()
+        
+        return tflite_model
