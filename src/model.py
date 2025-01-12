@@ -43,31 +43,11 @@ class GearboxAnomalyDetector:
         return model
     
     def train(self, 
-             train_dataset: tf.data.Dataset,
-             val_dataset: tf.data.Dataset,
-             epochs: int = 100) -> tf.keras.callbacks.History:
-        """Train with accuracy monitoring."""
-        
-        class AccuracyMonitor(tf.keras.callbacks.Callback):
-            def __init__(self, threshold_percentile=97):
-                super().__init__()
-                self.threshold_percentile = threshold_percentile
-                self.best_accuracy = 0
-                
-            def on_epoch_end(self, epoch, logs=None):
-                # Calculate reconstruction error on validation data
-                val_pred = self.model.predict(self.validation_data[0])
-                val_errors = np.mean(np.square(
-                    self.validation_data[0] - val_pred), axis=1)
-                threshold = np.percentile(val_errors, self.threshold_percentile)
-                
-                # Log accuracy metrics
-                if logs is not None:
-                    logs['val_accuracy'] = float(np.mean(
-                        val_errors <= threshold))
-        
+         train_dataset: tf.data.Dataset,
+         val_dataset: tf.data.Dataset,
+         epochs: int = 100) -> tf.keras.callbacks.History:
+        """Train with simple, robust callbacks."""
         callbacks = [
-            AccuracyMonitor(),
             tf.keras.callbacks.EarlyStopping(
                 monitor='val_loss',
                 patience=15,
@@ -78,7 +58,8 @@ class GearboxAnomalyDetector:
                 monitor='val_loss',
                 factor=0.5,  # Power of 2 for better quantization
                 patience=7,
-                min_lr=1e-6
+                min_lr=1e-6,
+                verbose=1
             )
         ]
         
