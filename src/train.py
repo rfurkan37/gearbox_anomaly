@@ -17,9 +17,23 @@ def setup_logging():
     )
 
 def prepare_data(data_dir: str, extractor: GearboxFeatureExtractor):
-    """Prepare training data."""
+    """Prepare training data with flexible file pattern matching."""
     train_dir = Path(data_dir) / "gearbox" / "train"
-    train_files = list(train_dir.glob("normal_*.wav"))
+    
+    # Add debug information
+    logging.info(f"Looking for training files in: {train_dir}")
+    if not train_dir.exists():
+        raise ValueError(f"Training directory not found: {train_dir}")
+    
+    # More flexible file pattern - any wav file with 'normal' in the name
+    train_files = [f for f in train_dir.glob("*.wav") if "normal" in f.name.lower()]
+    
+    if not train_files:
+        # List all files in directory to help diagnose the issue
+        all_files = list(train_dir.glob("*")) if train_dir.exists() else []
+        logging.error("No .wav files containing 'normal' in filename found")
+        logging.error(f"Files in directory: {[f.name for f in all_files]}")
+        raise ValueError("No training files found - looking for .wav files with 'normal' in name")
     
     logging.info(f"Found {len(train_files)} training files")
     
@@ -28,6 +42,9 @@ def prepare_data(data_dir: str, extractor: GearboxFeatureExtractor):
     for file in tqdm(train_files, desc="Extracting features"):
         feature = extractor.extract_features(str(file))
         features.append(feature)
+    
+    if not features:
+        raise ValueError("No features were extracted from the audio files")
     
     features = np.vstack(features)
     logging.info(f"Extracted features shape: {features.shape}")
