@@ -1,34 +1,28 @@
 import tensorflow as tf
 import numpy as np
-from typing import Tuple
 
 class GearboxAnomalyDetector:
-    """Lightweight anomaly detector for gearbox sounds."""
+    """Ultra-lightweight anomaly detector for Pico deployment."""
     
     def __init__(self, input_dim: int):
         self.input_dim = input_dim
         self.model = self._build_model()
         
     def _build_model(self) -> tf.keras.Model:
-        """Build model optimized for M0+ architecture."""
-        # Use power-of-2 layer sizes for efficient memory alignment
+        """Build tiny model for Pico."""
         model = tf.keras.Sequential([
             # Input layer
             tf.keras.layers.InputLayer(input_shape=(self.input_dim,)),
-            # Use individual scaling/shifting instead of BatchNorm for M0+
             tf.keras.layers.Lambda(lambda x: x * 0.125),  # Power-of-2 scaling
             
-            # Encoder optimized for integer math
-            tf.keras.layers.Dense(64, activation='relu'),  # Power of 2
-            tf.keras.layers.Dense(32, activation='relu'),  # Power of 2
+            # Minimal encoder (reduced from original)
+            tf.keras.layers.Dense(32, activation='relu'),   # Reduced from 64
             
-            # Bottleneck with power-of-2 size
-            tf.keras.layers.Dense(16, activation='relu'),
+            # Tiny bottleneck
+            tf.keras.layers.Dense(8, activation='relu'),    # Reduced from 16
             
-            # Decoder matching encoder
-            tf.keras.layers.Dense(32, activation='relu'),
-            tf.keras.layers.Dense(64, activation='relu'),
-            tf.keras.layers.Dense(self.input_dim)
+            # Direct anomaly score output
+            tf.keras.layers.Dense(1, activation='sigmoid')  # Changed to direct scoring
         ])
         
         # Use fixed learning rate for better quantization
@@ -36,7 +30,7 @@ class GearboxAnomalyDetector:
         
         model.compile(
             optimizer=optimizer,
-            loss='mse',
+            loss='binary_crossentropy',  # Changed to match new output
             jit_compile=True
         )
         
@@ -45,21 +39,14 @@ class GearboxAnomalyDetector:
     def train(self, 
          train_dataset: tf.data.Dataset,
          val_dataset: tf.data.Dataset,
-         epochs: int = 100) -> tf.keras.callbacks.History:
-        """Train with simple, robust callbacks."""
+         epochs: int = 50) -> tf.keras.callbacks.History:
+        """Train with minimal callbacks."""
         callbacks = [
             tf.keras.callbacks.EarlyStopping(
                 monitor='val_loss',
-                patience=15,
+                patience=5,  # Reduced from 15
                 restore_best_weights=True,
                 min_delta=1e-4
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor='val_loss',
-                factor=0.5,  # Power of 2 for better quantization
-                patience=7,
-                min_lr=1e-6,
-                verbose=1
             )
         ]
         
@@ -72,70 +59,37 @@ class GearboxAnomalyDetector:
         )
     
     def get_threshold(self, normal_features: np.ndarray) -> float:
-        """Calculate robust threshold with accuracy consideration."""
+        """Calculate simple threshold."""
         predictions = self.model.predict(normal_features, batch_size=32)
-        errors = np.mean(np.square(normal_features - predictions), axis=1)
         
-        # Calculate multiple threshold candidates
-        percentile_threshold = np.percentile(errors, 97)
-        mad_threshold = np.median(errors) + (2.5 * np.median(
-            np.abs(errors - np.median(errors))))
-        
-        # Use cross-validation to select best threshold
-        def evaluate_threshold(threshold):
-            predictions = errors > threshold
-            # Assuming all training data is normal
-            accuracy = np.mean(predictions == 0)
-            return accuracy
-        
-        accuracies = [
-            evaluate_threshold(percentile_threshold),
-            evaluate_threshold(mad_threshold)
-        ]
-        
-        # Return threshold with best accuracy
-        best_threshold = [percentile_threshold, mad_threshold][
-            np.argmax(accuracies)]
-        
-        return float(best_threshold)
-    
-    def save(self, path: str):
-        """Save the model."""
-        self.model.save(path)
+        # Simple percentile threshold
+        threshold = np.percentile(predictions, 95)
+        return float(threshold)
     
     def convert_to_tflite(self) -> bytes:
-        """Convert to M0+ optimized TFLite model."""
+        """Convert to heavily optimized TFLite model."""
         converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
         
-        # Optimize for M0+ architecture
+        # Maximum optimization
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.target_spec.supported_ops = [
             tf.lite.OpsSet.TFLITE_BUILTINS_INT8
         ]
         
-        # Force fixed-point quantization for M0+
+        # Force INT8 quantization
         converter.inference_input_type = tf.int8
         converter.inference_output_type = tf.int8
         
         def representative_dataset():
-            # Generate data matching expected signal characteristics
-            for _ in range(500):  # More samples for better calibration
-                # Generate base signal
-                base = np.random.normal(0, 1, (1, self.input_dim))
-                # Add typical gearbox harmonics
-                harmonics = np.sin(np.linspace(0, 10, self.input_dim)) * 0.1
-                # Add noise
-                noise = np.random.normal(0, 0.05, (1, self.input_dim))
-                
-                data = (base + harmonics.reshape(1, -1) + noise).astype(np.float32)
-                # Scale to expected range
+            for _ in range(100):  # Reduced from 500
+                # Simpler synthetic data
+                data = np.random.normal(0, 1, (1, self.input_dim))
+                data = data.astype(np.float32)
                 data = data / np.max(np.abs(data))
                 yield [data]
         
         converter.representative_dataset = representative_dataset
-        
-        # Additional M0+ specific optimizations
         converter.target_spec.supported_types = [tf.int8]
-        converter._experimental_disable_per_channel = True  # Force per-tensor quant
+        converter._experimental_disable_per_channel = True
         
         return converter.convert()
