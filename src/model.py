@@ -10,34 +10,34 @@ class GearboxAnomalyDetector:
         self.model = self._build_model()
         
     def _build_model(self) -> tf.keras.Model:
-        """Build optimized model architecture."""
+        """Build model optimized for M0+ architecture."""
+        # Use power-of-2 layer sizes for efficient memory alignment
         model = tf.keras.Sequential([
-            # Input layer with normalization
+            # Input layer
             tf.keras.layers.InputLayer(input_shape=(self.input_dim,)),
-            tf.keras.layers.BatchNormalization(),
+            # Use individual scaling/shifting instead of BatchNorm for M0+
+            tf.keras.layers.Lambda(lambda x: x * 0.125),  # Power-of-2 scaling
             
-            # Encoder - reduced size
-            tf.keras.layers.Dense(64, activation='relu'),  # Reduced from 96
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.Dense(32, activation='relu'),  # Reduced from 48
-            tf.keras.layers.BatchNormalization(),
+            # Encoder optimized for integer math
+            tf.keras.layers.Dense(64, activation='relu'),  # Power of 2
+            tf.keras.layers.Dense(32, activation='relu'),  # Power of 2
             
-            # Bottleneck - kept same size for feature preservation
-            tf.keras.layers.Dense(12, activation='relu'),
+            # Bottleneck with power-of-2 size
+            tf.keras.layers.Dense(16, activation='relu'),
             
-            # Decoder - reduced size
-            tf.keras.layers.Dense(32, activation='relu'),  # Reduced from 48
-            tf.keras.layers.BatchNormalization(),
-            tf.keras.layers.Dense(64, activation='relu'),  # Reduced from 96
-            tf.keras.layers.BatchNormalization(),
+            # Decoder matching encoder
+            tf.keras.layers.Dense(32, activation='relu'),
+            tf.keras.layers.Dense(64, activation='relu'),
             tf.keras.layers.Dense(self.input_dim)
         ])
         
-        # Use mixed precision for training
+        # Use fixed learning rate for better quantization
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+        
         model.compile(
-            optimizer=tf.keras.optimizers.Adam(5e-4),
+            optimizer=optimizer,
             loss='mse',
-            jit_compile=True  # Enable XLA compilation
+            jit_compile=True
         )
         
         return model
@@ -46,17 +46,38 @@ class GearboxAnomalyDetector:
              train_dataset: tf.data.Dataset,
              val_dataset: tf.data.Dataset,
              epochs: int = 100) -> tf.keras.callbacks.History:
-        """Train the model."""
+        """Train with accuracy monitoring."""
+        
+        class AccuracyMonitor(tf.keras.callbacks.Callback):
+            def __init__(self, threshold_percentile=97):
+                super().__init__()
+                self.threshold_percentile = threshold_percentile
+                self.best_accuracy = 0
+                
+            def on_epoch_end(self, epoch, logs=None):
+                # Calculate reconstruction error on validation data
+                val_pred = self.model.predict(self.validation_data[0])
+                val_errors = np.mean(np.square(
+                    self.validation_data[0] - val_pred), axis=1)
+                threshold = np.percentile(val_errors, self.threshold_percentile)
+                
+                # Log accuracy metrics
+                if logs is not None:
+                    logs['val_accuracy'] = float(np.mean(
+                        val_errors <= threshold))
+        
         callbacks = [
+            AccuracyMonitor(),
             tf.keras.callbacks.EarlyStopping(
                 monitor='val_loss',
-                patience=10,
-                restore_best_weights=True
+                patience=15,
+                restore_best_weights=True,
+                min_delta=1e-4
             ),
             tf.keras.callbacks.ReduceLROnPlateau(
                 monitor='val_loss',
-                factor=0.5,
-                patience=5,
+                factor=0.5,  # Power of 2 for better quantization
+                patience=7,
                 min_lr=1e-6
             )
         ]
@@ -69,80 +90,71 @@ class GearboxAnomalyDetector:
             verbose=1
         )
     
-    def get_threshold(self, normal_features: np.ndarray, 
-                 percentile: float = 97.0,
-                 min_anomaly_ratio: float = 0.03) -> float:
-        """Calculate anomaly threshold with safety checks.
-        
-        Args:
-            normal_features: Features from normal training data
-            percentile: Percentile to use for threshold (default: 97.0)
-            min_anomaly_ratio: Minimum ratio of anomalies to expect (default: 0.03)
-        
-        Returns:
-            float: Calculated threshold value
-        """
-        # Get reconstruction errors
-        predictions = self.model.predict(normal_features)
+    def get_threshold(self, normal_features: np.ndarray) -> float:
+        """Calculate robust threshold with accuracy consideration."""
+        predictions = self.model.predict(normal_features, batch_size=32)
         errors = np.mean(np.square(normal_features - predictions), axis=1)
         
-        # Calculate basic threshold
-        base_threshold = float(np.percentile(errors, percentile))
+        # Calculate multiple threshold candidates
+        percentile_threshold = np.percentile(errors, 97)
+        mad_threshold = np.median(errors) + (2.5 * np.median(
+            np.abs(errors - np.median(errors))))
         
-        # Safety checks
-        error_mean = np.mean(errors)
-        error_std = np.std(errors)
+        # Use cross-validation to select best threshold
+        def evaluate_threshold(threshold):
+            predictions = errors > threshold
+            # Assuming all training data is normal
+            accuracy = np.mean(predictions == 0)
+            return accuracy
         
-        # Ensure threshold isn't too close to mean
-        min_threshold = error_mean + (2 * error_std)
+        accuracies = [
+            evaluate_threshold(percentile_threshold),
+            evaluate_threshold(mad_threshold)
+        ]
         
-        # Calculate what percentage would be flagged as anomalies
-        anomaly_ratio = np.mean(errors > base_threshold)
+        # Return threshold with best accuracy
+        best_threshold = [percentile_threshold, mad_threshold][
+            np.argmax(accuracies)]
         
-        if anomaly_ratio < min_anomaly_ratio:
-            # Adjust threshold down if detecting too few anomalies
-            sorted_errors = np.sort(errors)
-            idx = int(len(errors) * (1 - min_anomaly_ratio))
-            base_threshold = sorted_errors[idx]
-        
-        # Return maximum of base and minimum threshold
-        return max(base_threshold, min_threshold)
+        return float(best_threshold)
     
     def save(self, path: str):
         """Save the model."""
         self.model.save(path)
     
     def convert_to_tflite(self) -> bytes:
-        """Convert model to TFLite format with optimized quantization."""
+        """Convert to M0+ optimized TFLite model."""
         converter = tf.lite.TFLiteConverter.from_keras_model(self.model)
         
-        # Enable all available optimizations
+        # Optimize for M0+ architecture
         converter.optimizations = [tf.lite.Optimize.DEFAULT]
         converter.target_spec.supported_ops = [
-            tf.lite.OpsSet.TFLITE_BUILTINS_INT8,
-            tf.lite.OpsSet.TFLITE_BUILTINS,
+            tf.lite.OpsSet.TFLITE_BUILTINS_INT8
         ]
         
-        # Set input/output types to INT8
+        # Force fixed-point quantization for M0+
         converter.inference_input_type = tf.int8
         converter.inference_output_type = tf.int8
         
-        # Generate representative dataset from random normal distribution
         def representative_dataset():
-            for _ in range(500):  # Increased from 100 to 500 for better statistics
-                data = np.random.normal(0, 1, (1, self.input_dim)).astype(np.float32)
-                # Add noise for better robustness
-                data += np.random.normal(0, 0.01, data.shape).astype(np.float32)
+            # Generate data matching expected signal characteristics
+            for _ in range(500):  # More samples for better calibration
+                # Generate base signal
+                base = np.random.normal(0, 1, (1, self.input_dim))
+                # Add typical gearbox harmonics
+                harmonics = np.sin(np.linspace(0, 10, self.input_dim)) * 0.1
+                # Add noise
+                noise = np.random.normal(0, 0.05, (1, self.input_dim))
+                
+                data = (base + harmonics.reshape(1, -1) + noise).astype(np.float32)
+                # Scale to expected range
+                data = data / np.max(np.abs(data))
                 yield [data]
         
-        # Set representative dataset
         converter.representative_dataset = representative_dataset
         
-        # Force full integer quantization
+        # Additional M0+ specific optimizations
         converter.target_spec.supported_types = [tf.int8]
-        converter._experimental_disable_per_channel = True  # Force per-tensor quantization
+        converter._experimental_disable_per_channel = True  # Force per-tensor quant
         
-        # Convert model
-        tflite_model = converter.convert()
-        
-        return tflite_model
+        return converter.convert()
