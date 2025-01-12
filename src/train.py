@@ -25,44 +25,57 @@ def prepare_data(data_dir: str, extractor: GearboxFeatureExtractor):
     if not train_dir.exists():
         raise ValueError(f"Training directory not found: {train_dir}")
     
-    # More flexible file pattern - any wav file with 'normal' in the name
-    train_files = [f for f in train_dir.glob("*.wav") if "normal" in f.name.lower()]
+    # Get normal and anomaly files
+    normal_files = [f for f in train_dir.glob("*.wav") if "normal" in f.name.lower()]
+    anomaly_files = [f for f in train_dir.glob("*.wav") if "anomaly" in f.name.lower()]
     
-    if not train_files:
-        # List all files in directory to help diagnose the issue
-        all_files = list(train_dir.glob("*")) if train_dir.exists() else []
-        logging.error("No .wav files containing 'normal' in filename found")
-        logging.error(f"Files in directory: {[f.name for f in all_files]}")
-        raise ValueError("No training files found - looking for .wav files with 'normal' in name")
+    if not normal_files:
+        raise ValueError("No normal training files found")
     
-    logging.info(f"Found {len(train_files)} training files")
+    logging.info(f"Found {len(normal_files)} normal and {len(anomaly_files)} anomaly files")
     
-    # Extract features
+    # Extract features and create labels
     features = []
-    for file in tqdm(train_files, desc="Extracting features"):
+    labels = []
+    
+    # Process normal files
+    for file in tqdm(normal_files, desc="Extracting normal features"):
         feature = extractor.extract_features(str(file))
         features.append(feature)
+        labels.extend([0] * len(feature))  # 0 for normal
     
-    if not features:
-        raise ValueError("No features were extracted from the audio files")
+    # Process anomaly files if available
+    if anomaly_files:
+        for file in tqdm(anomaly_files, desc="Extracting anomaly features"):
+            feature = extractor.extract_features(str(file))
+            features.append(feature)
+            labels.extend([1] * len(feature))  # 1 for anomaly
     
     features = np.vstack(features)
+    labels = np.array(labels)
+    
     logging.info(f"Extracted features shape: {features.shape}")
     
     # Split train/validation
-    np.random.shuffle(features)
+    indices = np.random.permutation(len(features))
     split_idx = int(len(features) * 0.9)
-    train_features = features[:split_idx]
-    val_features = features[split_idx:]
+    train_idx, val_idx = indices[:split_idx], indices[split_idx:]
+    
+    train_features = features[train_idx]
+    train_labels = labels[train_idx]
+    val_features = features[val_idx]
+    val_labels = labels[val_idx]
     
     # Create datasets
-    train_dataset = tf.data.Dataset.from_tensor_slices((train_features, train_features))
-    train_dataset = train_dataset.shuffle(10000).batch(64).prefetch(tf.data.AUTOTUNE)
+    train_dataset = tf.data.Dataset.from_tensor_slices(
+        (train_features, train_labels)
+    ).shuffle(10000).batch(64).prefetch(tf.data.AUTOTUNE)
     
-    val_dataset = tf.data.Dataset.from_tensor_slices((val_features, val_features))
-    val_dataset = val_dataset.batch(64).prefetch(tf.data.AUTOTUNE)
+    val_dataset = tf.data.Dataset.from_tensor_slices(
+        (val_features, val_labels)
+    ).batch(64).prefetch(tf.data.AUTOTUNE)
     
-    return train_dataset, val_dataset, train_features
+    return train_dataset, val_dataset, train_features[train_labels == 0]  # Only normal for threshold
 
 def main(args):
     """Main training function."""
@@ -73,7 +86,7 @@ def main(args):
     extractor = GearboxFeatureExtractor()
     
     # Prepare data
-    train_dataset, val_dataset, train_features = prepare_data(
+    train_dataset, val_dataset, normal_features = prepare_data(
         args.data_dir,
         extractor
     )
@@ -82,8 +95,8 @@ def main(args):
     model = GearboxAnomalyDetector(extractor.get_feature_dim())
     history = model.train(train_dataset, val_dataset, args.epochs)
     
-    # Calculate threshold
-    threshold = model.get_threshold(train_features)
+    # Calculate threshold using only normal data
+    threshold = model.get_threshold(normal_features)
     
     # Convert to TFLite
     tflite_model = model.convert_to_tflite()
@@ -100,13 +113,14 @@ def main(args):
     
     logging.info(f"Model saved to {output_dir}")
     logging.info(f"Final model size: {len(tflite_model) / 1024:.1f} KB")
+    logging.info(f"Threshold value: {threshold:.6f}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train gearbox anomaly detector")
     parser.add_argument("--data-dir", type=str, required=True, help="Path to dataset")
     parser.add_argument("--output-dir", type=str, default="models/gearbox", 
                       help="Output directory")
-    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     
     args = parser.parse_args()
     main(args)

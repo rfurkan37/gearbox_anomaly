@@ -10,6 +10,7 @@ class GearboxFeatureExtractor:
         self.hop_length = 128    # Reduced from 512
         self.n_mels = 32        # Reduced from 80
         self.segment_length = 8  # Reduced from 32
+        self.n_bands = 4        # Number of frequency bands
         
     def extract_features(self, audio_file: str) -> np.ndarray:
         """Extract minimal features optimized for Pico."""
@@ -33,7 +34,14 @@ class GearboxFeatureExtractor:
         
         # 3. Simplified spectral features (4 frequency bands)
         spec = np.abs(librosa.stft(y, n_fft=self.frame_length, hop_length=self.hop_length))
-        spec_bands = np.mean(np.split(spec, 4, axis=0), axis=1)
+        
+        # Calculate frequency band energies
+        n_freqs = spec.shape[0]
+        band_size = n_freqs // self.n_bands
+        spec_bands = np.array([
+            np.mean(spec[i:i + band_size], axis=0)
+            for i in range(0, n_freqs - band_size + 1, band_size)
+        ])
         
         # Combine features
         features = np.vstack([
